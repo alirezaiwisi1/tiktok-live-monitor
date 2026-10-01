@@ -1,0 +1,10 @@
+{
+  "name": "tiktok-live-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monitor public TikTok LIVE status for configured accounts using TikTok-Live-Connector.",
+  "type": "module",
+  "engines": {"node": ">=20.0.0"},
+  "scripts": {"start": "node src/index.js", "dev": "node --watch src/index.js"},
+  "dependencies": {"express": "^5.1.0", "tiktok-live-connector": "^2.5.0"}
+}
