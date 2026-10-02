@@ -1,6 +1,9 @@
-// لیست حساب‌های TikTok که باید چک شوند (بدون @)
-// می‌توانید از .env هم بدهید: TIKTOK_ACCOUNTS=user1,user2
-module.exports = [
+/**
+ * Central list of TikTok accounts to monitor.
+ * Add or remove usernames here (without the leading @).
+ * Every other module imports this list — never hard-code usernames elsewhere.
+ */
+export const accounts = [
   "aropl.afganistan",
   "nasarhashem",
   "keyvan.alalmahdi",

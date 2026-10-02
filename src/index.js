@@ -1,37 +1,74 @@
-require("dotenv").config();
-const express = require("express");
-const routes = require("./routes");
-const accounts = require("./accounts");
-const { checkAll } = require("./tiktok-monitor");
+/**
+ * index.js — entry point + JSON API (ESM).
+ * Loads env, accounts, notifier; starts one independent monitor per account.
+ * Exposes GET /api/status and GET /health for the website.
+ */
+
+import "dotenv/config";
+import express from "express";
+import { accounts } from "./accounts.js";
+import { startAll, stopAll, getStates } from "./tiktok-monitor.js";
+import { telegramConfigured, log } from "./notifier.js";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const INTERVAL = (process.env.CHECK_INTERVAL_SECONDS || 60) * 1000;
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
-// اگر در .env لیست داده شده، جایگزین accounts.js می‌شود
-const envAccounts = (process.env.TIKTOK_ACCOUNTS || "").split(",").map(s => s.trim()).filter(Boolean);
-if (envAccounts.length) {
-  accounts.length = 0;
-  accounts.push(...envAccounts);
+console.log("====================================");
+console.log("TikTok LIVE Monitor");
+console.log("====================================");
+log("info", `Monitoring ${accounts.length} accounts`);
+
+if (!telegramConfigured) {
+  log("warn", "Telegram credentials are missing — notifications disabled, monitoring continues");
+} else {
+  log("info", "Telegram notifications enabled");
 }
 
-app.use(express.static("public"));
-app.use("/api", routes);
+accounts.forEach((u) => log("info", `Starting @${u}`));
+startAll(accounts);
+log("info", "All monitors started");
 
-app.listen(PORT, () => {
-  console.log(`✅ tiktok-live-monitor running on http://localhost:${PORT}`);
-  console.log(`👀 monitoring ${accounts.length} accounts: ${accounts.join(", ")}`);
+// --- JSON API ---
+app.get("/api/status", (req, res) => {
+  const states = getStates();
+  res.json({
+    live: states.filter((s) => s.isLive),
+    offline: states.filter((s) => !s.isLive),
+    checkedAt: new Date().toISOString(),
+  });
 });
 
-// کش وضعیت هر INTERVAL ثانیه (برای کاهش درخواست‌های تکراری)
-let cache = null;
-async function refresh() {
+app.get("/health", (req, res) => {
+  res.json({ ok: true, uptime: process.uptime(), accounts: accounts.length });
+});
+
+const server = app.listen(PORT, () => {
+  log("info", `API listening on http://localhost:${PORT} (GET /api/status, GET /health)`);
+});
+
+// Never crash on unexpected errors.
+process.on("uncaughtException", (err) => {
+  log("error", `Uncaught exception (service keeps running): ${err.message}`);
+});
+process.on("unhandledRejection", (err) => {
+  log("error", `Unhandled rejection (service keeps running): ${err?.message ?? err}`);
+});
+
+// Graceful shutdown.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log("info", `Shutting down (${signal})...`);
   try {
-    cache = await checkAll(accounts);
-    console.log(`[${new Date().toLocaleTimeString()}] live: ${cache.filter(r => r.live).map(r => r.username).join(", ") || "—"}`);
-  } catch (e) {
-    console.error("refresh error:", e.message);
+    stopAll();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  } catch (err) {
+    log("error", `During shutdown: ${err.message}`);
+    process.exit(0);
   }
+  log("info", "All monitors stopped.");
 }
-refresh();
-setInterval(refresh, INTERVAL);
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
