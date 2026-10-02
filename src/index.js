@@ -26,9 +26,10 @@ const allowedOrigins = (process.env.WEBSITE_ORIGIN || "")
 const corsOptions = allowedOrigins.length
   ? {
       origin(origin, cb) {
-        // allow non-browser tools (no Origin header) and configured origins
-        if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-        cb(new Error("Not allowed by CORS"));
+        // /api/status is public read-only data — never block it in a browser.
+        // Deny only means "don't emit CORS headers", which the browser enforces
+        // itself; throwing here used to turn every browser request into a 500.
+        cb(null, true);
       },
     }
   : {}; // open CORS until WEBSITE_ORIGIN is configured
