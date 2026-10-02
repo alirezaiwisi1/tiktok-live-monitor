@@ -1,22 +1,29 @@
 /**
  * tiktok-monitor.js — per-account LIVE monitoring (ESM).
  *
- * Uses tiktok-live-connector v2 (TikTokLiveConnection).
- * Verified against the installed package (v2.x dist):
- *   - import: { TikTokLiveConnection, WebcastEvent, ControlAction }
- *   - connect() resolves when the streamer is LIVE, rejects otherwise
- *     (e.g. UserOfflineError).
- *   - events actually emitted: "connected", "disconnected", "error",
- *     WebcastEvent.STREAM_END ("streamEnd"), WebcastEvent.CONTROL_MESSAGE
- *     (ControlAction.CONTROL_ACTION_STREAM_ENDED = 3).
+ * tiktok-live-connector v2.5.0 verified behavior (probed against the installed dist):
+ *   - `connect()` can RESOLVE even when the user is NOT live (TikTok accepts the
+ *     websocket for some offline accounts and roomInfo comes back with
+ *     status_code 4003110). So "connected" alone is NOT reliable evidence of LIVE.
+ *   - `connection.fetchIsLive()` is the dedicated, reliable check (HTTP composite).
+ *
+ * Correct architecture:
+ *   1. Poll `fetchIsLive()` on a fixed interval — this is the ONLY thing that
+ *      sets isLive = true.
+ *   2. While LIVE, hold a websocket connection for events (streamEnd / control
+ *      message) so we detect the END of the stream quickly; any disconnect
+ *      clears isLive immediately.
+ *   3. All state is in-memory per-account and reset at startup — no stale LIVE
+ *      can survive a restart.
  */
 
 import { TikTokLiveConnection, WebcastEvent, ControlAction } from "tiktok-live-connector";
 import { notifyLive, log } from "./notifier.js";
 
 const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "30000", 10);
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "60000", 10);
 
-/** username -> { connection, state, reconnectTimer, connecting } */
+/** username -> { state, connection, pollTimer, connecting, wsConnected } */
 const monitors = new Map();
 
 function newState(username) {
@@ -30,111 +37,154 @@ function newState(username) {
   };
 }
 
-/** Schedule a reconnect with a single timer per account. */
-function scheduleReconnect(username, reason) {
-  const m = monitors.get(username);
-  if (!m) return;
-  if (m.reconnectTimer) clearTimeout(m.reconnectTimer); // avoid duplicate timers
-  log("warn", `Reconnecting @${username} in ${RECONNECT_DELAY_MS}ms (${reason})`);
-  m.reconnectTimer = setTimeout(() => {
-    m.reconnectTimer = null;
-    startMonitor(username).catch((err) =>
-      log("error", `Reconnect for @${username} failed: ${err.message}`)
-    );
-  }, RECONNECT_DELAY_MS);
-}
-
-function goOffline(username, mon, reason) {
+/** Immediately mark offline and reset notification arming. */
+function goOffline(username, reason) {
+  const mon = monitors.get(username);
+  if (!mon) return;
   const wasLive = mon.state.isLive;
   mon.state.isLive = false;
   mon.state.connected = false;
-  mon.state.lastOfflineAt = new Date().toISOString();
-  mon.state.lastNotificationAt = null; // re-arm notification for next session
-  if (wasLive) log("info", `@${username} went OFFLINE (${reason})`);
+  mon.wsConnected = false;
+  if (wasLive) {
+    mon.state.lastOfflineAt = new Date().toISOString();
+    log("info", `@${username} went OFFLINE (${reason})`);
+  }
 }
 
-/**
- * Start (or restart) monitoring one account.
- * Guarantees only one active connection per username.
- */
-export async function startMonitor(username) {
-  if (!monitors.has(username)) {
-    monitors.set(username, {
-      state: newState(username),
-      connection: null,
-      reconnectTimer: null,
-      connecting: false,
-    });
-  }
-  const mon = monitors.get(username);
-  if (mon.connecting || mon.connected) return; // duplicate connection guard
-
-  // Clean up any previous connection before reconnecting.
+/** Tear down the websocket for an account (kept after stop, single owner). */
+function dropConnection(username, mon) {
   if (mon.connection) {
     try { mon.connection.disconnect(); } catch { /* ignore */ }
     mon.connection = null;
   }
+  mon.wsConnected = false;
+}
 
-  mon.connecting = true;
-  const connection = new TikTokLiveConnection(username, {});
-  mon.connection = connection;
+/** Schedule one poll cycle (single timer per account). */
+function schedulePoll(username, reason, delay = POLL_INTERVAL_MS) {
+  const mon = monitors.get(username);
+  if (!mon) return;
+  if (mon.pollTimer) clearTimeout(mon.pollTimer);
+  mon.pollTimer = setTimeout(() => {
+    mon.pollTimer = null;
+    pollAccount(username).catch((err) =>
+      log("error", `Poll for @${username} crashed: ${err.message}`)
+    );
+  }, delay);
+  if (reason) log("debug", `@${username} next poll in ${delay}ms (${reason})`);
+}
 
-  connection.on("connected", (state) => {
-    mon.connecting = false;
-    mon.connected = true;
-    mon.state.connected = true;
-    mon.state.isLive = true;
-    mon.state.lastLiveAt = new Date().toISOString();
+/**
+ * One poll cycle for one account:
+ *  - fetchIsLive() is the source of truth.
+ *  - false  -> goOffline (no matter what previous state was), schedule next poll.
+ *  - true   -> if not currently tracking a live session, attach the websocket
+ *              for end-of-stream detection and mark LIVE (notify once).
+ */
+async function pollAccount(username) {
+  const mon = monitors.get(username);
+  if (!mon) return;
 
-    // OFFLINE -> LIVE transition: notify once per session.
-    if (!mon.state.lastNotificationAt) {
-      mon.state.lastNotificationAt = new Date().toISOString();
-      notifyLive(username); // async, errors handled inside notifier
-    }
-    log("info", `@${username} is LIVE (roomId ${state?.roomId ?? "?"})`);
-  });
-
-  connection.on("disconnected", () => {
-    mon.connecting = false;
-    goOffline(username, mon, "disconnected");
-    scheduleReconnect(username, "disconnected");
-  });
-
-  connection.on("streamEnd", () => {
-    goOffline(username, mon, "stream ended");
-    // Stream over: drop the connection and poll again later.
-    try { connection.disconnect(); } catch { /* ignore */ }
-    mon.connected = false;
-    scheduleReconnect(username, "stream ended");
-  });
-
-  connection.on("error", (err) => {
-    log("error", `@${username} connection error: ${err?.message ?? err}`);
-  });
-
-  // Stream officially ended via control message (action = 3).
-  connection.on(WebcastEvent.CONTROL_MESSAGE, (msg) => {
-    if (msg?.action === ControlAction.CONTROL_ACTION_STREAM_ENDED) {
-      goOffline(username, mon, "control: stream ended");
-    }
-  });
-
-  log("info", `Connecting to @${username}...`);
+  let live;
   try {
-    await connection.connect();
-    // "connected" handler fires on success; connect() only resolves when live.
+    if (!mon.probe) mon.probe = new TikTokLiveConnection(username, {});
+    live = await mon.probe.fetchIsLive();
   } catch (err) {
-    mon.connecting = false;
-    mon.connected = false;
-    const name = err?.name || err?.constructor?.name || "";
-    if (/offline/i.test(name) || /offline/i.test(err?.message || "")) {
-      // Not live right now — normal case; poll again after the delay.
-      log("info", `@${username} is not LIVE right now`);
-    } else {
-      log("warn", `Unable to connect to @${username}: ${err?.message ?? err}`);
-    }
-    scheduleReconnect(username, "not live / connect failed");
+    // Could not determine (network/sign errors). Fail SAFE: keep current
+    // state only if we have a live websocket; otherwise treat as offline.
+    log("warn", `@${username} fetchIsLive failed: ${err?.message ?? err}`);
+    if (!mon.wsConnected) goOffline(username, "isLive check failed");
+    schedulePoll(username, "check failed");
+    return;
   }
+
+  if (!live) {
+    if (mon.state.isLive || mon.wsConnected) {
+      dropConnection(username, mon);
+      goOffline(username, "fetchIsLive=false");
+    }
+    schedulePoll(username, "offline");
+    return;
+  }
+
+  // --- Account IS live ---
+  if (mon.wsConnected) {
+    // Already tracking this live session; nothing to do.
+    schedulePoll(username, "still live");
+    return;
+  }
+
+  // Fresh LIVE session: drop any leftover connection, mark live, notify once.
+  dropConnection(username, mon);
+  goOffline(username, "reset before live"); // clears stale flags w/o side effects
+  mon.state.isLive = true;
+  mon.state.connected = true;
+  mon.state.lastLiveAt = new Date().toISOString();
+  log("info", `@${username} is LIVE (confirmed by fetchIsLive)`);
+
+  // Attach websocket to catch stream end quickly.
+  try {
+    const connection = new TikTokLiveConnection(username, {});
+    mon.connection = connection;
+
+    connection.on("connected", () => {
+      mon.wsConnected = true;
+      mon.state.connected = true;
+      log("info", `@${username} live websocket attached`);
+    });
+    connection.on("disconnected", () => {
+      if (mon.state.isLive) {
+        goOffline(username, "websocket disconnected");
+        schedulePoll(username, "ws lost", 5000); // re-check quickly
+      }
+    });
+    connection.on("streamEnd", () => {
+      dropConnection(username, mon);
+      goOffline(username, "streamEnd event");
+      schedulePoll(username, "stream ended");
+    });
+    connection.on(WebcastEvent.CONTROL_MESSAGE, (msg) => {
+      if (msg?.action === ControlAction.CONTROL_ACTION_STREAM_ENDED) {
+        dropConnection(username, mon);
+        goOffline(username, "control: stream ended");
+        schedulePoll(username, "control stream ended");
+      }
+    });
+    connection.on("error", (err) => {
+      log("warn", `@${username} ws error: ${err?.message ?? err}`);
+    });
+
+    await connection.connect();
+    mon.wsConnected = true;
+    mon.state.connected = true;
+    log("info", `@${username} live websocket attached`);
+  } catch (err) {
+    // Websocket attach failed — the HTTP check already said LIVE, keep state
+    // but rely on polling to notice the end.
+    log("warn", `@${username} live ws attach failed (still marked LIVE via HTTP check): ${err?.message ?? err}`);
+  }
+
+  // OFFLINE -> LIVE transition: notify once per session.
+  if (!mon.state.lastNotificationAt) {
+    mon.state.lastNotificationAt = new Date().toISOString();
+    notifyLive(username);
+  }
+  schedulePoll(username, "live, verifying", POLL_INTERVAL_MS);
+}
+
+/** Start monitoring one account (idempotent). */
+export async function startMonitor(username) {
+  if (monitors.has(username)) return; // already running
+  monitors.set(username, {
+    state: newState(username),
+    probe: null,
+    connection: null,
+    pollTimer: null,
+    wsConnected: false,
+  });
+  log("info", `Monitoring @${username} (poll every ${POLL_INTERVAL_MS}ms)`);
+  // stagger initial polls slightly to spread load
+  schedulePoll(username, "initial", Math.floor(Math.random() * 5000));
 }
 
 /** Start monitoring a list of accounts. One failure never stops the others. */
@@ -153,14 +203,13 @@ export function startAll(accountList) {
 /** Graceful shutdown: stop timers and disconnect everything. */
 export function stopAll() {
   for (const [username, mon] of monitors) {
-    if (mon.reconnectTimer) {
-      clearTimeout(mon.reconnectTimer);
-      mon.reconnectTimer = null;
+    if (mon.pollTimer) {
+      clearTimeout(mon.pollTimer);
+      mon.pollTimer = null;
     }
-    if (mon.connection) {
-      try { mon.connection.disconnect(); } catch { /* ignore */ }
-    }
-    mon.connected = false;
+    dropConnection(username, mon);
+    mon.state.isLive = false;
+    mon.state.connected = false;
     log("info", `Stopped @${username}`);
   }
 }
