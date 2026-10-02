@@ -6,12 +6,38 @@
 
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import { accounts } from "./accounts.js";
 import { startAll, stopAll, getStates } from "./tiktok-monitor.js";
 import { telegramConfigured, log } from "./notifier.js";
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
+
+// --- CORS ---
+// WEBSITE_ORIGIN = comma-separated list of allowed origins (no trailing slash).
+// Example: WEBSITE_ORIGIN=https://my-site.onrender.com,https://my-site.netlify.app
+// Unset => CORS open (any origin) so the site works before configuration.
+const allowedOrigins = (process.env.WEBSITE_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
+const corsOptions = allowedOrigins.length
+  ? {
+      origin(origin, cb) {
+        // allow non-browser tools (no Origin header) and configured origins
+        if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+        cb(new Error("Not allowed by CORS"));
+      },
+    }
+  : {}; // open CORS until WEBSITE_ORIGIN is configured
+app.use(cors(corsOptions));
+if (allowedOrigins.length) {
+  log("info", `CORS: allowing origins: ${allowedOrigins.join(", ")}`);
+} else {
+  log("warn", "CORS: WEBSITE_ORIGIN not set — allowing all origins");
+}
 
 console.log("====================================");
 console.log("TikTok LIVE Monitor");

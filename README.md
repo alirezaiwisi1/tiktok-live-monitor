@@ -44,6 +44,7 @@ cp .env.example .env   # then edit .env — never commit it
 | `RECONNECT_DELAY_MS` | `30000` | Delay between reconnect attempts |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `PORT` | `3000` | API port |
+| `WEBSITE_ORIGIN` | — (open) | Comma-separated list of allowed website origins for CORS, **no trailing slash**. Example: `https://my-site.onrender.com,https://my-site.netlify.app`. If unset, CORS is open to all origins — set it in production. |
 
 ## TikTok accounts
 
@@ -74,7 +75,7 @@ No other file needs to change.
 Website usage example:
 
 ```js
-fetch("http://your-server:3000/api/status")
+fetch("https://your-app.onrender.com/api/status")
   .then(r => r.json())
   .then(d => {
     d.live.forEach(u => {
@@ -82,6 +83,10 @@ fetch("http://your-server:3000/api/status")
     });
   });
 ```
+
+> **CORS note:** for a browser (`fetch` from your website) to succeed, set
+> `WEBSITE_ORIGIN` on the Render service to your website's origin (e.g.
+> `https://my-site.onrender.com`) and redeploy. Multiple origins: separate with commas.
 
 ### `GET /health`
 
