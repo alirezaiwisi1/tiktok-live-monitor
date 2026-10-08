@@ -8,7 +8,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { accounts } from "./accounts.js";
-import { startAll, stopAll, getStates } from "./tiktok-monitor.js";
+import { startAll, stopAll, getStates, addAccounts } from "./tiktok-monitor.js";
 import { telegramConfigured, log } from "./notifier.js";
 
 const app = express();
@@ -54,6 +54,26 @@ if (!telegramConfigured) {
 accounts.forEach((u) => log("info", `Starting @${u}`));
 startAll(accounts);
 log("info", "All monitors started");
+
+// --- Auto-discovery: merge accounts from the website roster so a new TikTok
+// account added via the CMS starts being monitored without a redeploy. Never
+// removes accounts — removal stays a deliberate code change here.
+const ROSTER_URL = process.env.ROSTER_URL || "https://aroplfarsi.pages.dev/assets/js/tiktok-accounts.js";
+const ROSTER_REFRESH_MS = parseInt(process.env.ROSTER_REFRESH_MS || "600000", 10);
+async function refreshRoster() {
+  try {
+    const res = await fetch(ROSTER_URL, { headers: { accept: "application/javascript", "user-agent": "aropl-live-monitor/1.0" } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const js = await res.text();
+    const names = [...js.matchAll(/username:\s*"([^"]+)"/g)].map((m) => m[1]);
+    const fresh = addAccounts(names);
+    if (fresh.length) log("info", `Roster refresh: started monitoring ${fresh.join(", ")}`);
+  } catch (err) {
+    log("warn", `Roster refresh failed: ${err.message}`);
+  }
+}
+refreshRoster();
+setInterval(refreshRoster, ROSTER_REFRESH_MS);
 
 // --- JSON API ---
 app.get("/api/status", (req, res) => {

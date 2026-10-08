@@ -201,6 +201,23 @@ export function startAll(accountList) {
 }
 
 /** Graceful shutdown: stop timers and disconnect everything. */
+/** Dynamically add accounts (no-ops for ones already monitored). Returns the newly started list. */
+export function addAccounts(usernameList) {
+  const added = [];
+  for (const username of usernameList) {
+    if (!username || monitors.has(username)) continue;
+    try {
+      startMonitor(username).catch((err) =>
+        log("error", `Monitor for @${username} crashed: ${err.message}`)
+      );
+      added.push(username);
+    } catch (err) {
+      log("error", `Monitor for @${username} failed to start: ${err.message}`);
+    }
+  }
+  return added;
+}
+
 export function stopAll() {
   for (const [username, mon] of monitors) {
     if (mon.pollTimer) {
